@@ -35,18 +35,10 @@
 .text
 .balign 4
 
-// In-game menu assets
-DEF_ASSET(ingame_menu_payload, "ingamemenu.payload")
 
 // Direct save payload
 DEF_ASSET(directsave_payload, "directsave.payload")
 
 // DLDI payload (builtin!)
 DEF_ASSET(dldi_payload, "superfw.dldi.payload")
-
-// IGM trampoline gadget for NOR flashed games
-#ifdef SUPPORT_NORGAMES
-  DEF_ASSET(ingame_trampoline_payload, "ingame_trampoline.payload")
-#endif
-
 

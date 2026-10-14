@@ -31,7 +31,6 @@
 #include "messages.h"
 #include "save.h"
 #include "cheats.h"
-#include "ingame.h"
 #include "emu.h"
 #include "recent.h"
 #include "flash_mgr.h"
@@ -85,11 +84,6 @@ enum {
 #define BG_COLOR         17
 #define FT_COLOR         18
 #define HI_COLOR         19
-#define IGM_PAL_FG      240
-#define IGM_PAL_BG      241
-#define IGM_PAL_HI      242
-#define IGM_PAL_SH      243
-#define IGM_PAL_BL      244
 #define SEL_COLOR       255
 
 #define FLASH_UNLOCK_KEYS      (KEY_BUTTDOWN|KEY_BUTTB|KEY_BUTTSTA)
@@ -119,7 +113,6 @@ enum {
 
 enum {
   SettTitle1 = 0,
-  SettHotkey,
   SettBootType,
   SettFastSD,
   #ifdef SUPPORT_NORGAMES
@@ -131,11 +124,8 @@ enum {
   SettSaveLocNOR,
   #endif
   SettSaveBkp,
-  SettStateLoc,
-  SettCheatEn,
   SettTitle2,
   DefsPatchEng,
-  DefsGamMenu,
   DefsRTCEnb,
   DefsRTCVal,
   DefsRTCSpeed,
@@ -428,6 +418,7 @@ static t_oamobj fobjs[64];
 
 static void games_reload(void);
 static void browser_reload(void);
+static bool insert_recent_flush(const char *fn, unsigned flags);
 
 unsigned lang_lookup(uint16_t code) {
   for (unsigned i = 0; i < LANG_COUNT; i++)
@@ -619,33 +610,13 @@ static const t_patch * get_game_patch(const t_load_gba_info *info) {
 }
 
 bool ingame_menu_avail_sdram(const t_load_gba_info *info) {
-  const t_patch *p = get_game_patch(info);
-  // Necessary size to load the IGM (+fonts +cheats)
-  const unsigned igm_reqsz = ROUND_UP2(ingame_menu_payload.menu_rsize + font_block_size() + spop.p.load.l.cheats_size, 1024);
-
-  // If the ROM is too big, must use some hole to load the menu.
-  if (info->romfs > MAX_GBA_ROM_SIZE - igm_reqsz) {
-    // Discard holes that are too small, or not well formed.
-    if (!p || p->hole_size < igm_reqsz || p->hole_addr + p->hole_size > info->romfs)
-      return false;   // Too big to fit the menu!
-  }
-
-  // Check if the patches exist and have proper IRQ support.
-  return p && p->irqh_ops > 0;
+  (void)info;
+  return false;  // No In-Game menu is compiled or installed.
 }
 
 bool ingame_menu_avail_flash(const t_load_gba_info *info) {
-  const t_patch *p = get_game_patch(info);
-
-  // Checks if the ROM is small enough so the last 4MiB block can be remapped.
-  if (info->romfs > MAX_GBA_ROM_SIZE - NOR_BLOCK_SIZE) {
-    // Otherwise find a gap to flash on NOR our tiny payload
-    if (!p || p->hole_size < DIRSAVE_REQ_SPACE || p->hole_addr + p->hole_size > info->romfs)
-      return false;   // Too big to fit!
-  }
-
-  // Check if the patches exist and have proper IRQ support.
-  return p && p->irqh_ops > 0;
+  (void)info;
+  return false;  // No In-Game menu is compiled or installed.
 }
 
 // Calculates whether DirectSaving can be used given some information.
@@ -744,47 +715,25 @@ static bool prepare_gba_info(
 
   // Fill defaults as requested if possible.
   bool allowds = load_sdram ? dirsav_avail_sdram(info) : dirsav_avail_flash(info);
-  bool allowigm = load_sdram ? ingame_menu_avail_sdram(info) : ingame_menu_avail_flash(info);
 
   info->rtc_patch_enabled = st->use_rtc && rtcemu_avail(info);
   info->use_dsaving = st->use_dsaving && allowds;
-  info->ingame_menu_enabled = st->use_igm && allowigm;
+  info->ingame_menu_enabled = false;
 
   return true;
 }
 
 static void prepare_gba_cheats(const char *gcode, uint8_t ver, t_load_gba_lcfg *data, const char *fn, bool prefer_cheats) {
-  // Attempt to find a cheat file if cheats are enabled.
+  // Cheat controls and execution have been removed from the in-game menu.
+  // Ignore saved preferences so a hidden/old cheat configuration cannot run.
+  (void)gcode;
+  (void)ver;
+  (void)fn;
+  (void)prefer_cheats;
   data->cheats_size = 0;
   data->cheats_found = false;
-  if (enable_cheats) {
-    strcpy(data->cheatsfn, fn);
-    replace_extension(data->cheatsfn, ".cht");
-    data->cheats_found = check_file_exists(data->cheatsfn);
-    if (!data->cheats_found) {
-      WRITE_LOG("No cheat file found at '%s'", data->cheatsfn);
-      // Create a path using the game ID and version.
-      npf_snprintf(data->cheatsfn, sizeof(data->cheatsfn), CHEATS_PATH "%c%c%c%c-%02x.cht",
-                   gcode[0], gcode[1], gcode[2], gcode[3], ver);
-      data->cheats_found = check_file_exists(data->cheatsfn);
-      WRITE_LOG("No cheat file found at '%s'", data->cheatsfn);
-
-      // Load the cheats into memory if enabled.
-      if (data->cheats_found) {
-        // Load the cheats to the ROM area, just after the font pack. This is for easier relocation.
-        uint8_t *cheat_area = (uint8_t*)(ROM_FONTBASE_U8 + font_block_size());
-        unsigned max_area = 1536*1024 - font_block_size();    // 1.5MB is reserved at the end.
-        int cheatsz = open_read_cheats(cheat_area, max_area, data->cheatsfn);
-        if (cheatsz < 0)
-          data->cheats_found = false;
-        else
-          data->cheats_size = cheatsz;
-
-        WRITE_LOG("Loaded cheats returned %d", cheatsz);
-      }
-    }
-  }
-  data->use_cheats = enable_cheats && data->cheats_found && prefer_cheats;
+  data->use_cheats = false;
+  data->cheatsfn[0] = 0;
 }
 
 static void prepare_gba_settings(t_load_gba_lcfg *data, bool uses_dsaving, uint32_t rtcts, bool game_no_save) {
@@ -813,6 +762,58 @@ static void prepare_gba_settings(t_load_gba_lcfg *data, bool uses_dsaving, uint3
 }
 
 
+// Shared launch path: preserve the original save, patch, RTC and loader logic.
+// No configuration popup is needed to start a game.
+static void launch_prepared_gba(void) {
+  if (!ingame_menu_avail_sdram(&spop.p.load.i))
+    spop.p.load.i.ingame_menu_enabled = false;
+  if (!rtcemu_avail(&spop.p.load.i))
+    spop.p.load.i.rtc_patch_enabled = false;
+  if (!spop.p.load.l.cheats_found || !spop.p.load.i.ingame_menu_enabled)
+    spop.p.load.l.use_cheats = false;
+
+  // Insert the ROM into the recent list (or move it around). Flush to disk!
+  if (recent_menu)
+    insert_recent_flush(spop.p.load.i.romfn, FLAG_RECENT_SD);
+
+  // Honor load.patch_type.
+  const t_patch *p = get_game_patch(&spop.p.load.i);
+  EnumSavetype st = p ? p->save_mode : SaveTypeNone;
+
+  // Prepare the savegame (load and store stuff, directsave...)
+  t_dirsave_info dsinfo;
+  unsigned errsave = prepare_savegame(
+    spop.p.load.l.sram_load_type, spop.p.load.l.sram_save_type,
+    st, &dsinfo, spop.p.load.l.savefn);
+  if (errsave) {
+    unsigned errmsg = (errsave == ERR_SAVE_BADSAVE)   ? MSG_ERR_SAVERD :
+                      (errsave == ERR_SAVE_CANTALLOC) ? MSG_ERR_SAVEPR :
+                      (errsave == ERR_SAVE_BADARG)    ? MSG_ERR_SAVEIT :
+                                                        MSG_ERR_SAVEWR;
+    spop.alert_msg = msgs[lang_id][errmsg];
+    return;
+  }
+
+  t_rtc_info rtci = {
+    .timestamp = spop.p.load.l.rtcval,
+    .ts_step = rtcspeed_default
+  };
+
+  unsigned err = load_gba_rom(
+    spop.p.load.i.romfn, spop.p.load.i.romfs,
+    spop.p.load.l.sram_save_type == SaveDisable ? NULL : spop.p.load.l.savefn, p,
+    spop.p.load.l.sram_save_type == SaveDirect ? &dsinfo : NULL,
+    spop.p.load.i.ingame_menu_enabled,
+    spop.p.load.i.rtc_patch_enabled ? &rtci : NULL,
+    spop.p.load.l.use_cheats ? spop.p.load.l.cheats_size : 0,
+    loadrom_progress);
+  if (err) {
+    // Show any errors that might have happened!
+    spop.alert_msg = msgs[lang_id][MSG_ERR_READ];
+    // TODO: We cannot (in many cases) continue since we trash the SDRAM!
+  }
+}
+
 static void browser_open_gba(const char *fn, uint32_t fs, bool prompt_patchgen) {
   if (fs > MAX_GBA_ROM_SIZE) {
     // The ROM is too big to be loaded!
@@ -838,22 +839,26 @@ static void browser_open_gba(const char *fn, uint32_t fs, bool prompt_patchgen) 
     else {
       const t_rom_header *rmh = &spop.p.load.i.romh;
 
-      // If patch engine is selected but no patches found, prompt for generation.
-      // If auto is selected and no patches nor DB entries found, do prompt too.
+      // Generate missing patches for Engine/Auto before starting the game.
       bool no_patches = (ld_sett.patch_policy == PatchAuto &&
                          !spop.p.load.i.patches_datab_found && !spop.p.load.i.patches_cache_found);
       bool no_engine  = (ld_sett.patch_policy == PatchEngine && !spop.p.load.i.patches_cache_found);
       bool issfw = is_superfw(rmh);
 
       if (prompt_patchgen && !issfw && (no_patches || no_engine)) {
-        // No patches found, ask the user if they want to generate patches
-        // using the patch engine.
-        spop.qpop.message = msgs[lang_id][no_patches ? MSG_Q1_NOPATCH : MSG_Q1_PATCHENG];
-        spop.qpop.default_button = msgs[lang_id][MSG_Q_NO];
-        spop.qpop.confirm_button = msgs[lang_id][MSG_Q_YES];
-        spop.qpop.option = 0;
-        spop.qpop.callback = patch_gen_callback;
-        spop.qpop.clear_popup_ok = true;
+        // Generate missing compatibility patches automatically, without a
+        // question or settings screen. Reprepare to honor the generated cache.
+        if (!generate_patches_progress(spop.p.load.i.romfn, fs) ||
+            !load_cached_patches(spop.p.load.i.romfn, &spop.p.load.i.patches_cache)) {
+          // Patch generation can use SDRAM occupied by the directory list.
+          if (smenu.menu_tab == MENUTAB_GAMES)
+            games_reload();
+          else if (smenu.menu_tab == MENUTAB_ROMBROWSE)
+            browser_reload();
+          spop.alert_msg = msgs[lang_id][MSG_ERR_READ];
+          return;
+        }
+        browser_open_gba(spop.p.load.i.romfn, fs, false);
         return;
       }
 
@@ -868,11 +873,10 @@ static void browser_open_gba(const char *fn, uint32_t fs, bool prompt_patchgen) 
       sram_filename_calc(fn, spop.p.load.l.savefn, save_path_default);
       prepare_gba_settings(&spop.p.load.l, spop.p.load.i.use_dsaving, lh_sett.rtcts, game_no_save);
 
-      // Show load ROM menu.
-      spop.pop_num = POPUP_GBA_LOAD;
-      spop.anim = 0;
-      spop.submenu = GbaLoadPopInfo;
-      spop.selector = GBALoadButt;
+      // A starts the game immediately, using the configured defaults.
+      // Settings remain in their existing tab, outside the launch flow.
+      spop.pop_num = POPUP_NONE;
+      launch_prepared_gba();
     }
   }
 }
@@ -1897,11 +1901,7 @@ void render_settings(volatile uint8_t *frame) {
   if (optnum++ >= baseopt && optcnt < maxrows)
     draw_central_text(msgs[lang_id][MSG_SET_TITL1], frame, SCREEN_WIDTH/2, offy + rowh*optcnt++);
 
-  if (optnum++ >= baseopt && optcnt < maxrows) {
-    npf_snprintf(tmp, sizeof(tmp), "< %s >", hotkey_list[hotkey_combo].cname);
-    draw_text_ovf(msgs[lang_id][MSG_SETT_HOTK], frame, 8, offy + rowh*optcnt, 224);
-    draw_central_text(tmp, frame, colx, offy + rowh*optcnt++);
-  }
+
 
   if (optnum++ >= baseopt && optcnt < maxrows) {
     draw_text_ovf(msgs[lang_id][MSG_SETT_BOOT], frame, 8, offy + rowh*optcnt, 224);
@@ -1950,16 +1950,9 @@ void render_settings(volatile uint8_t *frame) {
     draw_central_text(tmp, frame, colx, offy + rowh*optcnt++ );
   }
 
-  if (optnum++ >= baseopt && optcnt < maxrows) {
-    draw_text_ovf(msgs[lang_id][MSG_SETT_STATET], frame, 8, offy + rowh*optcnt, 224);
-    npf_snprintf(tmp, sizeof(tmp), "< %s >", savestates_paths_display[state_path_default]);
-    draw_central_text(tmp, frame, colx, offy + rowh*optcnt++);
-  }
 
-  if (optnum++ >= baseopt && optcnt < maxrows) {
-    draw_text_ovf(msgs[lang_id][MSG_SETT_CHTEN], frame, 8, offy + rowh*optcnt, 224);
-    draw_central_text(msgs[lang_id][enable_cheats ? MSG_KNOB_ENABLED : MSG_KNOB_DISABLED], frame, colx, offy + rowh*optcnt++);
-  }
+
+
 
   if (optnum++ >= baseopt && optcnt < maxrows)
     draw_central_text(msgs[lang_id][MSG_SET_TITL2], frame, SCREEN_WIDTH/2, offy + rowh*optcnt++);
@@ -1969,10 +1962,7 @@ void render_settings(volatile uint8_t *frame) {
     draw_central_text(msgs[lang_id][MSG_PATCH_TYPE0 + patcher_default], frame, colx, offy + rowh*optcnt++);
   }
 
-  if (optnum++ >= baseopt && optcnt < maxrows) {
-    draw_text_ovf(msgs[lang_id][MSG_LOADER_MENU], frame, 8, offy + rowh*optcnt, 224);
-    draw_central_text(msgs[lang_id][MSG_KNOB_DISABLED + ingamemenu_default], frame, colx, offy + rowh*optcnt++);
-  }
+
 
   if (optnum++ >= baseopt && optcnt < maxrows) {
     draw_text_ovf(msgs[lang_id][MSG_LOADER_RTCE], frame, 8, offy + rowh*optcnt, 224);
@@ -2026,10 +2016,6 @@ void render_settings(volatile uint8_t *frame) {
       npf_snprintf(tmp, sizeof(tmp), msgs[lang_id][MSG_SAVE_TYPE_PT], save_paths[save_path_default]);
       draw_text_ovf_rotate(tmp, frame, 4, SCREEN_HEIGHT - 18, 232, &smenu.anim_state);
     }
-  }
-  else if (smenu.set.selector == SettStateLoc) {
-    npf_snprintf(tmp, sizeof(tmp), msgs[lang_id][MSG_STATE_TYPE_PT], savestates_paths[state_path_default]);
-    draw_text_ovf_rotate(tmp, frame, 4, SCREEN_HEIGHT - 18, 232, &smenu.anim_state);
   }
   #ifdef SUPPORT_NORGAMES
   else if (smenu.set.selector == SettSaveLocNOR) {
@@ -2162,11 +2148,6 @@ void reload_theme(unsigned thnum) {
   MEM_PALETTE[FT_COLOR] = themes[thnum].ft_color;
   MEM_PALETTE[HI_COLOR] = themes[thnum].hi_color;
   // In-game menu palette
-  MEM_PALETTE[IGM_PAL_FG] = themes[thnum].fg_color;
-  MEM_PALETTE[IGM_PAL_BG] = themes[thnum].bg_color;
-  MEM_PALETTE[IGM_PAL_HI] = themes[thnum].ft_color;
-  MEM_PALETTE[IGM_PAL_SH] = themes[thnum].sh_color;
-  MEM_PALETTE[IGM_PAL_BL] = themes[thnum].hi_blend;
 
   // Palette entries for icons and other objects
   MEM_PALETTE[256 + SEL_COLOR] = themes[thnum].hi_blend;
@@ -2554,46 +2535,7 @@ static void keypress_popup_loadgba(unsigned newkeys) {
       spop.alert_msg = msgs[lang_id][MSG_REMEMB_CFG_OK];
     }
     else if (GbaLoadPopInfo == spop.submenu) {
-      // Insert the ROM into the recent list (or move it around). Flush to disk!
-      if (recent_menu)
-        insert_recent_flush(spop.p.load.i.romfn, FLAG_RECENT_SD);
-
-      // Honor load.patch_type.
-      const t_patch *p = get_game_patch(&spop.p.load.i);
-      EnumSavetype st = p ? p->save_mode : SaveTypeNone;
-
-      // Prepare the savegame (load and store stuff, directsave...)
-      t_dirsave_info dsinfo;
-      unsigned errsave = prepare_savegame(
-        spop.p.load.l.sram_load_type, spop.p.load.l.sram_save_type,
-        st, &dsinfo, spop.p.load.l.savefn);
-      if (errsave) {
-        unsigned errmsg = (errsave == ERR_SAVE_BADSAVE)   ? MSG_ERR_SAVERD :
-                          (errsave == ERR_SAVE_CANTALLOC) ? MSG_ERR_SAVEPR :
-                          (errsave == ERR_SAVE_BADARG)    ? MSG_ERR_SAVEIT :
-                                                            MSG_ERR_SAVEWR;
-        spop.alert_msg = msgs[lang_id][errmsg];
-        return;
-      }
-
-      t_rtc_info rtci = {
-        .timestamp = spop.p.load.l.rtcval,
-        .ts_step = rtcspeed_default
-      };
-
-      unsigned err = load_gba_rom(
-        spop.p.load.i.romfn, spop.p.load.i.romfs,
-        spop.p.load.l.sram_save_type == SaveDisable ? NULL : spop.p.load.l.savefn, p,
-        spop.p.load.l.sram_save_type == SaveDirect ? &dsinfo : NULL,
-        spop.p.load.i.ingame_menu_enabled,
-        spop.p.load.i.rtc_patch_enabled ? &rtci : NULL,
-        spop.p.load.l.use_cheats ? spop.p.load.l.cheats_size : 0,
-        loadrom_progress);
-      if (err) {
-        // Show any errors that might have happened!
-        spop.alert_msg = msgs[lang_id][MSG_ERR_READ];
-        // TODO: We cannot (in many cases) continue since we trash the SDRAM!
-      }
+      launch_prepared_gba();
     }
   }
 
@@ -3173,16 +3115,12 @@ static void keypress_menu_settings(unsigned newkeys) {
   if (newkeys & KEY_BUTTDOWN)
     smenu.set.selector = MIN(SettMAX - 1, smenu.set.selector + 1);
   if (newkeys & KEY_BUTTLEFT) {
-    if (smenu.set.selector == SettHotkey)
-      hotkey_combo = (hotkey_combo + hotkey_listcnt - 1) % hotkey_listcnt;
-    else if (smenu.set.selector == SettSaveLoc)
+    if (smenu.set.selector == SettSaveLoc)
       save_path_default = (save_path_default + SaveDirCNT - 1) % SaveDirCNT;
     #ifdef SUPPORT_NORGAMES
     else if (smenu.set.selector == SettSaveLocNOR)
       save_path_nor_default = (save_path_nor_default + SaveDirNORCNT - 1) % SaveDirNORCNT;
     #endif
-    else if (smenu.set.selector == SettStateLoc)
-      state_path_default = (state_path_default + StateDirCNT - 1) % StateDirCNT;
     else if (smenu.set.selector == SettSaveBkp)
       backup_sram_default = backup_sram_default ? backup_sram_default - 1 : 0;
     else if (smenu.set.selector == DefsPatchEng)
@@ -3191,16 +3129,12 @@ static void keypress_menu_settings(unsigned newkeys) {
       rtcspeed_default = (rtcspeed_default + RTC_SPEED_CNT - 1) % RTC_SPEED_CNT;
   }
   if (newkeys & KEY_BUTTRIGHT) {
-    if (smenu.set.selector == SettHotkey)
-      hotkey_combo = (hotkey_combo + 1) % hotkey_listcnt;
-    else if (smenu.set.selector == SettSaveLoc)
+    if (smenu.set.selector == SettSaveLoc)
       save_path_default = (save_path_default + 1) % SaveDirCNT;
     #ifdef SUPPORT_NORGAMES
     else if (smenu.set.selector == SettSaveLocNOR)
       save_path_nor_default = (save_path_nor_default + 1) % SaveDirNORCNT;
     #endif
-    else if (smenu.set.selector == SettStateLoc)
-      state_path_default = (state_path_default + 1) % StateDirCNT;
     else if (smenu.set.selector == SettSaveBkp)
       backup_sram_default = MIN(MAX_BACKUP_CNT, backup_sram_default + 1);
     else if (smenu.set.selector == DefsPatchEng)
@@ -3211,10 +3145,6 @@ static void keypress_menu_settings(unsigned newkeys) {
   if (newkeys & (KEY_BUTTLEFT | KEY_BUTTRIGHT)) {
     if (smenu.set.selector == SettBootType)
       boot_bios_splash ^= 1;
-    else if (smenu.set.selector == SettCheatEn)
-      enable_cheats ^= 1;
-    else if (smenu.set.selector == DefsGamMenu)
-      ingamemenu_default ^= 1;
     else if (smenu.set.selector == DefsRTCEnb)
       rtcpatch_default ^= 1;
     else if (smenu.set.selector == DefsLoadPol)
