@@ -209,6 +209,18 @@ unsigned preload_gba_rom(const char *fn, uint32_t fs, t_rom_header *romh) {
   return err ? ERR_LOAD_BADROM : 0;
 }
 
+// A successful FatFs call may still return fewer bytes (for example at EOF).
+// Only the deliberate padding after the ROM may be filled; missing ROM bytes
+// must abort loading instead of copying uninitialized stack data to the cart.
+static bool read_rom_chunk(FIL *fd, uint32_t *buffer, unsigned readsize, unsigned copysize) {
+  UINT rdbytes = 0;
+  if (readsize && (f_read(fd, buffer, readsize, &rdbytes) != FR_OK || rdbytes != readsize))
+    return false;
+  if (copysize > readsize)
+    memset((uint8_t *)buffer + readsize, 0xFF, copysize - readsize);
+  return true;
+}
+
 NOINLINE
 unsigned load_gba_rom(
   const char *fn, uint32_t fs,
@@ -273,6 +285,12 @@ unsigned load_gba_rom(
   if (res != FR_OK)
     return ERR_LOAD_BADROM;
 
+  // Refuse a ROM changed/truncated since its header and patches were prepared.
+  if (f_size(&fd) != fs) {
+    f_close(&fd);
+    return ERR_LOAD_BADROM;
+  }
+
   // Calculate progress bar steps, carefully consider the gap (if any).
   const uint32_t load_steps = (gap_end <= fs  ? (fs - (gap_end - gap_start)) :
                                gap_start < fs ? (fs - gap_start)             : fs) / LOAD_BS;
@@ -287,9 +305,9 @@ unsigned load_gba_rom(
       progress(steps, load_steps);
 
     unsigned toread = MIN(LOAD_BS, gap_start - offset);
-    UINT rdbytes;
     uint32_t tmp[LOAD_BS/4];
-    if (FR_OK != f_read(&fd, tmp, toread, &rdbytes)) {
+    unsigned readsize = offset < fs ? MIN(toread, fs - offset) : 0;
+    if (!read_rom_chunk(&fd, tmp, readsize, toread)) {
       slowsd = true;
       f_close(&fd);
       return ERR_LOAD_BADROM;
@@ -313,9 +331,9 @@ unsigned load_gba_rom(
       progress(steps, load_steps);
 
     unsigned toread = MIN(LOAD_BS, fs - offset);
-    UINT rdbytes;
+    unsigned copysize = ROUND_UP2(toread, 4);
     uint32_t tmp[LOAD_BS/4];
-    if (FR_OK != f_read(&fd, tmp, toread, &rdbytes)) {
+    if (!read_rom_chunk(&fd, tmp, toread, copysize)) {
       slowsd = true;
       f_close(&fd);
       return ERR_LOAD_BADROM;
@@ -323,12 +341,13 @@ unsigned load_gba_rom(
 
     set_supercard_mode(MAPPED_SDRAM, true, false);
     if (use_slowld)
-      rom_copy_write16(&ptr[offset], tmp, toread);
+      rom_copy_write16(&ptr[offset], tmp, copysize);
     else
-      dma_memcpy32(&ptr[offset], tmp, toread/4);
+      dma_memcpy32(&ptr[offset], tmp, copysize/4);
     set_supercard_mode(MAPPED_SDRAM, true, true);
   }
-  progress(1, 1);  // Mark as complete
+  if (progress)
+    progress(1, 1);  // Mark as complete
 
   slowsd = true;
 

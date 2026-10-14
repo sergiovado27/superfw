@@ -36,7 +36,7 @@ int ds_read_eeprom(uint32_t block_num, uint8_t *buf) {
     return -1;
 
   // Check memory size to avoid overflow
-  if (block_num * 8 >= get_memory_size())
+  if (block_num >= get_memory_size() / 8)
     return -1;
 
   // We read straight from RAM.
@@ -53,7 +53,7 @@ int ds_write_eeprom(uint32_t block_num, const uint8_t *buf) {
     return -1;
 
   // Check memory size to avoid overflow
-  if (block_num * 8 >= get_memory_size())
+  if (block_num >= get_memory_size() / 8)
     return -1;
 
   const unsigned sram_off = block_num * 8;
@@ -117,7 +117,9 @@ int ds_write_sector_flash(const uint8_t *buf, uint32_t sectnum) {
 
   if (!validate_config())
     return -1;
-  if (sectnum * 4096 > get_memory_size())
+  // A sector at exactly the end is already out of bounds. Compare before
+  // multiplication as well, so a large sector number cannot wrap around.
+  if (sectnum >= get_memory_size() / 4096)
     return -1;
 
   if (sdcard_write_blocks(buf, base_sector() + sectnum * blpersector, blpersector))
@@ -152,7 +154,7 @@ int ds_erase_sector_flash(uint32_t sectnum) {
 
   if (!validate_config())
     return -1;
-  if (sectnum * 4096 > get_memory_size())
+  if (sectnum >= get_memory_size() / 4096)
     return -1;
 
   // Clear buffer and write that to the SD card
