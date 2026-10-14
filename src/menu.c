@@ -47,6 +47,7 @@ extern bool fastew;
 extern bool slowsd;
 
 enum {
+  MENUTAB_GAMES,         // Flat GBA library: root and up to three directories.
   MENUTAB_RECENT,        // Browses recently loaded ROMs (can be disabled / hidden)
   MENUTAB_ROMBROWSE,     // Browses ROMs and launches games.
   #ifdef SUPPORT_NORGAMES
@@ -61,11 +62,6 @@ enum {
 
 #define ANIM_INITIAL_WAIT     128    // Intial wait (in anim cycles)
 
-#define KEY_REPEAT_INITIAL    384    // Initial wait for key repeat
-#define KEY_REPEAT_MID        160    // Next key presses
-#define KEY_REPEAT_FAST        96    // End speed
-#define KEY_REPEAT_CNT1         5
-
 enum {
   POPUP_NONE,
   POPUP_GBA_LOAD,              // Load a GBA ROM
@@ -77,6 +73,8 @@ enum {
   POPUP_GBA_NORLOAD,           // Launch a NOR game
 #endif
 };
+
+#define GAMES_MAX_DEPTH              3
 
 #define BROWSER_ROWS                 8
 #define RECENT_ROWS                  9
@@ -276,6 +274,14 @@ static struct {
     int maxentries;               // Total file/dir count in current dir
   } recent;
 
+  // Shares the directory entry buffers with the file browser; reload on entry.
+  struct {
+    int selector;
+    int seloff;
+    int count;
+    bool partial;
+  } games;
+
   // ROM browser state
   struct {
     char cpath[MAX_FN_LEN];       // Current path
@@ -420,16 +426,15 @@ static unsigned framen = 0;
 static unsigned objnum = 0;
 static t_oamobj fobjs[64];
 
+static void games_reload(void);
+static void browser_reload(void);
+
 unsigned lang_lookup(uint16_t code) {
   for (unsigned i = 0; i < LANG_COUNT; i++)
     if (lang_codes[i] == code)
       return i;
 
   return 0;  // Fallback to default (english)
-}
-
-inline uint16_t curr_pressed_keys() {
-  return REG_KEYINPUT ^ 0x3FF;
 }
 
 uint16_t lang_getcode() {
@@ -725,15 +730,17 @@ static bool prepare_gba_info(
     else
       info->patch_type = PatchNone;
   }
-  else {
-    // Use the specified patch type.
-    info->patch_type = st->patch_policy;
-
-    // Downgrade to no patches if the specified was not found.
-    if ((info->patch_type == PatchDatabase && !info->patches_datab_found) ||
-        (info->patch_type == PatchEngine   && !info->patches_cache_found))
+  // Downgrade to no patches if the specified was not found.
+  else if (st->patch_policy == PatchDatabase) {
+    if (!info->patches_datab_found)
       info->patch_type = PatchNone;
   }
+  else if (st->patch_policy == PatchEngine) {
+    if (!info->patches_cache_found)
+      info->patch_type = PatchNone;
+  }
+  else
+    info->patch_type = st->patch_policy;
 
   // Fill defaults as requested if possible.
   bool allowds = load_sdram ? dirsav_avail_sdram(info) : dirsav_avail_flash(info);
@@ -965,9 +972,12 @@ static bool insert_recent_flush(const char *fn, unsigned flags) {
 static bool delete_recent_flush(unsigned entry_num) {
   smenu.recent.maxentries = delete_recent(sdr_state->rentries, smenu.recent.maxentries, entry_num);
 
-  smenu.recent.selector = MIN(smenu.recent.maxentries - 1, smenu.recent.selector);
-  if (!smenu.recent.maxentries)
-    smenu.menu_tab = MENUTAB_ROMBROWSE;
+  smenu.recent.selector = smenu.recent.maxentries ?
+    MIN(smenu.recent.maxentries - 1, smenu.recent.selector) : 0;
+  if (!smenu.recent.maxentries) {
+    smenu.menu_tab = MENUTAB_GAMES;
+    games_reload();
+  }
 
   return recent_flush(sdr_state->rentries, smenu.recent.maxentries);
 }
@@ -996,7 +1006,7 @@ void start_emu_game(const t_emu_loader *ldinfo, const char *fn, uint32_t fs) {
       if (recent_menu)
         insert_recent_flush(fn, FLAG_RECENT_SD);
 
-      errcode = load_extemu_rom(fn, fs, ldinfo, loadrom_progress);
+      unsigned errcode = load_extemu_rom(fn, fs, ldinfo, loadrom_progress);
       if (errcode && errcode != ERR_LOAD_NOEMU)
         break;
       ldinfo++;
@@ -1007,17 +1017,39 @@ void start_emu_game(const t_emu_loader *ldinfo, const char *fn, uint32_t fs) {
   }
 }
 
-NOINLINE static void browser_open(const char *fn, uint32_t fs) {
+// Compare extensions without subtracting from a potentially short filename.
+static bool has_extension(const char *fn, const char *extension) {
   const char *ext = find_extension(fn);
-  if (ext && !strcasecmp(ext, "gba"))
+  return ext && !strcasecmp(ext, extension);
+}
+
+// Paths here include a leading slash and must fit including their terminator.
+static bool join_path(char *out, const char *dir, const char *name, bool isdir) {
+  size_t dl = strlen(dir), nl = strlen(name);
+  if (dl + nl + (isdir ? 1 : 0) >= MAX_FN_LEN)
+    return false;
+  memcpy(out, dir, dl);
+  memcpy(out + dl, name, nl);
+  if (isdir)
+    out[dl + nl++] = '/';
+  out[dl + nl] = 0;
+  return true;
+}
+
+NOINLINE static void browser_open(const char *fn, uint32_t fs) {
+  if (strlen(fn) >= MAX_FN_LEN) {
+    spop.alert_msg = msgs[lang_id][MSG_ERR_GENERIC];
+    return;
+  }
+  if (has_extension(fn, ".gba"))
     // GBA ROMs (most likely)
     browser_open_gba(fn, fs, true);
-  else if (ext && !strcasecmp(ext, "sav")) {
+  else if (has_extension(fn, ".sav")) {
     spop.pop_num = POPUP_SAVFILE;
     spop.selector = SavMAX;
     strcpy(spop.p.savopt.savfn, fn);
   }
-  else if (ext && !strcasecmp(ext, "fw")) {
+  else if (has_extension(fn, ".fw")) {
     // A SuperFW firmware update is selected!
     if (!enable_flashing)
       spop.alert_msg = msgs[lang_id][MSG_FWUP_DISABLED];
@@ -1049,8 +1081,9 @@ NOINLINE static void browser_open(const char *fn, uint32_t fs) {
   }
   else {
     // Any emulator-based console supported
+    const char *ext = find_extension(fn);
     if (ext) {
-      const t_emu_loader *ldinfo = get_emu_info(ext);
+      const t_emu_loader *ldinfo = get_emu_info(&ext[1]);
       if (ldinfo) {
         start_emu_game(ldinfo, fn, fs);
         return;
@@ -1106,20 +1139,23 @@ static void browser_reload_filter() {
   heapsort4(sdr_state->fileorder, fcount, sizeof(t_centry*) / sizeof(uint32_t), filesort);
 
   if (smenu.browser.selector >= fcount)
-    smenu.browser.selector = fcount - 1;
+    smenu.browser.selector = fcount ? (int)fcount - 1 : 0;
   smenu.browser.seloff = MAX(0, smenu.browser.selector - BROWSER_ROWS / 2);
   smenu.browser.dispentries = fcount;
 }
 
 // Loads a new directory list in the ROM browser.
-// TODO: Implement filtering (.gba/.rom/.bin... etc) using settings
 static void browser_reload() {
   smenu.anim_state = 0;
 
   unsigned fcount = 0;
   DIR d;
-  if (FR_OK != f_opendir(&d, smenu.browser.cpath))
-    return;   // FIXME: Implement error reporting!
+  if (FR_OK != f_opendir(&d, smenu.browser.cpath)) {
+    smenu.browser.maxentries = 0;
+    browser_reload_filter();
+    spop.alert_msg = msgs[lang_id][MSG_ERR_READ];
+    return;
+  }
 
   while (1) {
     FILINFO info;
@@ -1129,6 +1165,12 @@ static void browser_reload() {
     if (fcount >= BROWSER_MAXFN_CNT)
       break;
 
+    // Keep every later path construction (including file management) in bounds.
+    char path[MAX_FN_LEN];
+    if (!strcmp(info.fname, ".") || !strcmp(info.fname, "..") ||
+        !join_path(path, smenu.browser.cpath, info.fname, info.fattrib & AM_DIR))
+      continue;
+
     t_centry *e = &sdr_state->fentries[fcount++];
     e->filesize = (uint32_t) info.fsize;  // TODO: Support 4GB+ files?
     e->isdir = (info.fattrib & AM_DIR) ? 1 : 0;
@@ -1136,10 +1178,72 @@ static void browser_reload() {
     dma_memcpy16(e->fname, info.fname, MAX_FN_LEN/2);
     sortable_utf8_u16(info.fname, e->sortname);
   }
+  f_closedir(&d);
   smenu.browser.maxentries = fcount;
 
   // Filter and sort list of files/dirs
   browser_reload_filter();
+}
+
+// Bounded depth-first scan. Root has depth 0; files at depth 3 are included.
+// No extra SDRAM list is allocated: fname stores the full path, sortname the
+// basename. Each directory handle is closed even on error or library overflow.
+static void games_scan(const char *path, unsigned depth) {
+  DIR dir;
+  if (f_opendir(&dir, path) != FR_OK) {
+    smenu.games.partial = true;
+    return;
+  }
+  while (smenu.games.count < BROWSER_MAXFN_CNT) {
+    FILINFO info;
+    FRESULT result = f_readdir(&dir, &info);
+    if (result != FR_OK) {
+      smenu.games.partial = true;
+      break;
+    }
+    if (!info.fname[0])
+      break;
+    if (!strcmp(info.fname, ".") || !strcmp(info.fname, "..") ||
+        ((info.fattrib & AM_HID) && hide_hidden))
+      continue;
+    bool isdir = (info.fattrib & AM_DIR) != 0;
+    if (!isdir && !has_extension(info.fname, ".gba"))
+      continue;
+    char fullpath[MAX_FN_LEN];
+    if (!join_path(fullpath, path, info.fname, isdir)) {
+      smenu.games.partial = true;
+      continue;
+    }
+    if (isdir) {
+      if (depth < GAMES_MAX_DEPTH)
+        games_scan(fullpath, depth + 1);
+      else
+        smenu.games.partial = true;
+    } else {
+      t_centry *e = &sdr_state->fentries[smenu.games.count];
+      e->filesize = (uint32_t)info.fsize;
+      e->isdir = 0;
+      e->attr = info.fattrib;
+      strcpy(e->fname, fullpath);
+      sortable_utf8_u16(info.fname, e->sortname);
+      sdr_state->fileorder[smenu.games.count++] = e;
+    }
+  }
+  if (smenu.games.count == BROWSER_MAXFN_CNT)
+    smenu.games.partial = true;
+  f_closedir(&dir);
+}
+
+static void games_reload(void) {
+  smenu.games.count = 0;
+  smenu.games.partial = false;
+  smenu.anim_state = 0;
+  games_scan("/", 0);
+  heapsort4(sdr_state->fileorder, smenu.games.count,
+            sizeof(t_centry*) / sizeof(uint32_t), filesort);
+  smenu.games.selector = smenu.games.count ?
+    MIN(smenu.games.selector, smenu.games.count - 1) : 0;
+  smenu.games.seloff = MAX(0, smenu.games.selector - BROWSER_ROWS / 2);
 }
 
 // Loads NOR game entries so they can be browsed.
@@ -1177,24 +1281,22 @@ static inline void render_icon_trans(unsigned x, unsigned y, unsigned iconn) {
 
 // Guess the file type based on the file name.
 static unsigned guessicon(const char *path) {
-  const char *ext = find_extension(path);
+  unsigned l = strlen(path);
+  if (l < 4)
+    return ICON_BINFILE;
 
-  if (ext) {
-    static const struct {
-      const char *ext;
-      unsigned icon;
-    } exticon[] = {
-      {"gba", ICON_GBACART},
-      {"gb",  ICON_GBCART},
-      {"gbc", ICON_GBCCART},
-      {"nes", ICON_NESCART},
-      {"sms", ICON_SMSCART},
-      {"fw",  ICON_UPDFILE},
-    };
-    for (unsigned i = 0; i < sizeof(exticon)/sizeof(exticon[0]); i++)
-      if (!strcasecmp(exticon[i].ext, ext))
-        return exticon[i].icon;
-  }
+  if (!strcasecmp(&path[l-4], ".gba"))
+    return ICON_GBACART;
+  else if (!strcasecmp(&path[l-3], ".gb"))
+    return ICON_GBCART;
+  else if (!strcasecmp(&path[l-4], ".gbc"))
+    return ICON_GBCCART;
+  else if (!strcasecmp(&path[l-4], ".nes"))
+    return ICON_NESCART;
+  else if (!strcasecmp(&path[l-4], ".sms"))
+    return ICON_SMSCART;
+  else if (!strcasecmp(&path[l-3], ".fw"))
+    return ICON_UPDFILE;
 
   return ICON_BINFILE;
 }
@@ -1388,6 +1490,32 @@ void render_flashbrowser(volatile uint8_t *frame) {
   draw_text_ovf(tmp, frame, 8, 144, SCREEN_WIDTH - 16);
 }
 #endif
+
+void render_games(volatile uint8_t *frame) {
+  dma_memset16(&frame[SCREEN_WIDTH * 144], dup8(FG_COLOR), SCREEN_WIDTH * 16 / 2);
+  if (!smenu.games.count)
+    draw_central_text("No hay juegos .gba", frame, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 8);
+  for (int i = 0; i < BROWSER_ROWS && smenu.games.seloff + i < smenu.games.count; i++) {
+    const t_centry *e = sdr_state->fileorder[smenu.games.seloff + i];
+    const char *name = strrchr(e->fname, '/');
+    name = name ? name + 1 : e->fname;
+    render_icon(2, (i + 1) * 16, ICON_GBACART);
+    if (smenu.games.seloff + i == smenu.games.selector)
+      draw_text_ovf_rotate(name, frame, 20, (i + 1) * 16,
+                          SCREEN_WIDTH - 24, &smenu.anim_state);
+    else
+      draw_text_ovf(name, frame, 20, (i + 1) * 16, SCREEN_WIDTH - 24);
+  }
+  if (smenu.games.count)
+    for (unsigned x = 0; x < SCREEN_WIDTH; x += 16)
+      render_icon_trans(x, (smenu.games.selector - smenu.games.seloff + 1) * 16, 63);
+  draw_text_ovf(smenu.games.partial ? "Juegos (lista parcial)" : "Juegos", frame,
+                8, 144, SCREEN_WIDTH - 16);
+  char counter[24];
+  npf_snprintf(counter, sizeof(counter), "%d/%d",
+               smenu.games.count ? smenu.games.selector + 1 : 0, smenu.games.count);
+  draw_rightj_text(counter, frame, SCREEN_WIDTH - 1, 1);
+}
 
 void render_browser(volatile uint8_t *frame) {
   // Render bar below to show path URI
@@ -1995,15 +2123,14 @@ void render_info(volatile uint8_t *frame) {
     draw_central_text(tmp, frame, 120, 110);
     break;
   case 3:
-    npf_snprintf(tmp, sizeof(tmp), "SD Card ID: %02x | %04x", sd_info.manufacturer, sd_info.oemid);
-    draw_central_text(tmp, frame, 120, 70);
+    if (sd_info.sdhc)
+      draw_central_text("SD card type: SDHC", frame, 120, 70);
+    else
+      draw_central_text("SD card type: SDSC", frame, 120, 70);
     human_size_kb(tmp2, sizeof(tmp2), sd_info.block_cnt / 2);
-    npf_snprintf(tmp, sizeof(tmp), "Type: %s  Size: %s", sd_info.sdhc ? "SDHC" : "SDSC", tmp2);
+    npf_snprintf(tmp, sizeof(tmp), msgs[lang_id][MSG_CAPACITY], tmp2);
     draw_central_text(tmp, frame, 120, 90);
-    npf_snprintf(tmp, sizeof(tmp), "Info: %c%c%c%c%c (%d/%d)",
-      sd_info.prodname[0] ?: '#', sd_info.prodname[1] ?: '#',
-      sd_info.prodname[2] ?: '#', sd_info.prodname[3] ?: '#',
-      sd_info.prodname[4] ?: '#', 2000 + sd_info.year, sd_info.month);
+    npf_snprintf(tmp, sizeof(tmp), "Card ID: %02x | %04x", sd_info.manufacturer, sd_info.oemid);
     draw_central_text(tmp, frame, 120, 110);
     break;
   }
@@ -2066,12 +2193,24 @@ void menu_render(unsigned fcnt) {
   dma_memset16(&frame[0], dup8(FG_COLOR), SCREEN_WIDTH*16/2);
 
   // Render icon bar
-  int mintab = (recent_menu && smenu.recent.maxentries) ? MENUTAB_RECENT : MENUTAB_ROMBROWSE;
-  for (unsigned i = mintab; i < MENUTAB_MAX; i++)
+  // Explicit icon mapping keeps existing tabs aligned after adding Games.
+  static const unsigned tabicons[] = {
+    ICON_GBACART, ICON_RECENT, ICON_DISK,
+    #ifdef SUPPORT_NORGAMES
+    ICON_FLASH,
+    #endif
+    ICON_SETTINGS, ICON_UILANG_SETTINGS, ICON_TOOLS, ICON_INFO,
+  };
+  unsigned visible = 0;
+  for (unsigned i = 0; i < MENUTAB_MAX; i++) {
+    if (i == MENUTAB_RECENT && !(recent_menu && smenu.recent.maxentries))
+      continue;
     if (i == smenu.menu_tab)
-      render_icon((i - mintab)*16, 0, i + ICON_RECENT);
+      render_icon(visible * 16, 0, tabicons[i]);
     else
-      render_icon_trans((i - mintab)*16, 0, i + ICON_RECENT);
+      render_icon_trans(visible * 16, 0, tabicons[i]);
+    visible++;
+  }
 
   // Render the main area
   dma_memset16(&frame[16*SCREEN_WIDTH], dup8(BG_COLOR), SCREEN_WIDTH*(SCREEN_HEIGHT-16) / 2);
@@ -2086,6 +2225,7 @@ void menu_render(unsigned fcnt) {
       spop.anim += fcnt * animspd_lut[anim_speed];
     } else {
       static const t_mrender_fn renderfns[] = {
+        render_games,
         render_recent,
         render_browser,
         #ifdef SUPPORT_NORGAMES
@@ -2139,7 +2279,8 @@ void menu_init(int sram_testres) {
 
   reload_theme(menu_theme);
 
-  smenu.menu_tab = (recent_menu && smenu.recent.maxentries) ? MENUTAB_RECENT : MENUTAB_ROMBROWSE;
+  games_reload();
+  smenu.menu_tab = MENUTAB_GAMES;
 
   // Load icons into VRAM
   dma_memcpy16(MEM_VRAM_OBJS, icons_img, sizeof(icons_img) / 2);
@@ -2491,7 +2632,7 @@ static void keypress_popup_savefile(unsigned newkeys) {
 }
 
 static void keypress_popup_flash(unsigned newkeys) {
-  if ((curr_pressed_keys() & FLASH_GO_KEYS) == FLASH_GO_KEYS)
+  if ((newkeys & FLASH_GO_KEYS) == FLASH_GO_KEYS)
     start_flash_update(spop.p.update.fn, spop.p.update.fw_size, spop.p.update.issfw);
 }
 
@@ -2877,6 +3018,28 @@ static void keypress_menu_recent(unsigned newkeys) {
     smenu.recent.seloff = smenu.recent.selector - RECENT_ROWS + 1;
 }
 
+static void keypress_menu_games(unsigned newkeys) {
+  if (!smenu.games.count)
+    return;
+  if (newkeys & KEY_BUTTUP)
+    smenu.games.selector = MAX(0, smenu.games.selector - 1);
+  if (newkeys & KEY_BUTTDOWN)
+    smenu.games.selector = MIN(smenu.games.count - 1, smenu.games.selector + 1);
+  if (newkeys & KEY_BUTTLEFT)
+    smenu.games.selector = MAX(0, smenu.games.selector - BROWSER_ROWS);
+  if (newkeys & KEY_BUTTRIGHT)
+    smenu.games.selector = MIN(smenu.games.count - 1, smenu.games.selector + BROWSER_ROWS);
+  if (smenu.games.selector < smenu.games.seloff)
+    smenu.games.seloff = smenu.games.selector;
+  else if (smenu.games.selector >= smenu.games.seloff + BROWSER_ROWS)
+    smenu.games.seloff = smenu.games.selector - BROWSER_ROWS + 1;
+  if (newkeys & KEY_BUTTA) {
+    const t_centry *e = sdr_state->fileorder[smenu.games.selector];
+    // Keep the full path, including directories, for the existing GBA loader.
+    browser_open(e->fname, e->filesize);
+  }
+}
+
 static void keypress_menu_browse(unsigned newkeys) {
   if (smenu.browser.dispentries) {
     // Move menu up and down
@@ -3192,7 +3355,7 @@ static void keypress_menu_tools(unsigned newkeys) {
 static void keypress_menu_info(unsigned newkeys) {
   if (newkeys & KEY_BUTTA)
     smenu.info.selector = (smenu.info.selector + 1) % 4;
-  if ((curr_pressed_keys() & FLASH_UNLOCK_KEYS) == FLASH_UNLOCK_KEYS)
+  if ((newkeys & FLASH_UNLOCK_KEYS) == FLASH_UNLOCK_KEYS)
     enable_flashing = true;
 }
 
@@ -3268,16 +3431,31 @@ void menu_keypress(unsigned newkeys) {
     }
   } else {
     // Menu change via trigger buttons
-    int mintab = (recent_menu && smenu.recent.maxentries) ? MENUTAB_RECENT : MENUTAB_ROMBROWSE;
-    if (newkeys & KEY_BUTTL)
-      smenu.menu_tab = MAX((int)smenu.menu_tab - 1, mintab);
-    else if (newkeys & KEY_BUTTR)
+    unsigned oldtab = smenu.menu_tab;
+    if (newkeys & KEY_BUTTL) {
+      if (smenu.menu_tab > MENUTAB_GAMES)
+        smenu.menu_tab--;
+      if (smenu.menu_tab == MENUTAB_RECENT && !(recent_menu && smenu.recent.maxentries))
+        smenu.menu_tab = MENUTAB_GAMES;
+    } else if (newkeys & KEY_BUTTR) {
       smenu.menu_tab = MIN(smenu.menu_tab + 1, MENUTAB_MAX - 1);
+      if (smenu.menu_tab == MENUTAB_RECENT && !(recent_menu && smenu.recent.maxentries))
+        smenu.menu_tab = MENUTAB_ROMBROWSE;
+    }
+    if (oldtab != smenu.menu_tab) {
+      if (smenu.menu_tab == MENUTAB_GAMES)
+        games_reload();
+      else if (smenu.menu_tab == MENUTAB_ROMBROWSE)
+        browser_reload();
+      // A tab-switch key must not also operate on the newly loaded list.
+      return;
+    }
 
     if (newkeys & (KEY_BUTTL | KEY_BUTTR | KEY_BUTTUP | KEY_BUTTDOWN))
       smenu.anim_state = 0;
 
     const t_mkeyupd_fn keyfns[] = {
+      keypress_menu_games,
       keypress_menu_recent,
       keypress_menu_browse,
       #ifdef SUPPORT_NORGAMES
@@ -3290,41 +3468,5 @@ void menu_keypress(unsigned newkeys) {
     };
     keyfns[smenu.menu_tab](newkeys);
   }
-}
-
-// Only repeat keys A/B and Dir
-const uint16_t keyrep = 0x0F3;
-static uint32_t keyreptmr[10] = {0};
-static uint8_t  keyrepcnt[10] = {0};
-static uint32_t prev_keys = 0;
-
-// Handle button input. Supports key re-press whenever a button is held for a while.
-// This key repeat pattern can be tuned for speed and what not.
-uint16_t get_keypress() {
-  uint32_t ckeys = curr_pressed_keys();
-  uint32_t mkeys = 0;
-  for (unsigned i = 0; i < 10; i++) {
-    if (ckeys & (1 << i)) {
-      if (!(prev_keys & (1 << i))) {
-        keyreptmr[i] = systime() + KEY_REPEAT_INITIAL;
-        mkeys |= (1 << i);
-        keyrepcnt[i] = 0;
-      }
-      else if (((1 << i) & keyrep) && systime() > keyreptmr[i]) {
-        if (keyrepcnt[i] > KEY_REPEAT_CNT1)
-          keyreptmr[i] = systime() + KEY_REPEAT_FAST;
-        else {
-          keyreptmr[i] = systime() + KEY_REPEAT_MID;
-          keyrepcnt[i]++;
-        }
-        mkeys |= (1 << i);
-      }
-    }
-    else
-      keyreptmr[i] = 0;
-  }
-
-  prev_keys = ckeys;
-  return mkeys;
 }
 
