@@ -4,7 +4,7 @@ run-name: Build a full SuperFW release
 on:
   push:
     branches:
-      - 'master'
+      - 'superfw-ui'
     tags:
       - '*'
 
