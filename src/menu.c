@@ -1209,7 +1209,10 @@ static void games_scan(const char *path, unsigned depth) {
     bool isdir = (info.fattrib & AM_DIR) != 0;
     if (!isdir && !has_extension(info.fname, ".gba"))
       continue;
-    char fullpath[MAX_FN_LEN];
+    // The cart SDRAM ignores byte stores. Stage an aligned, zero-padded path
+    // in internal RAM, then copy halfwords just like the original browser.
+    uint16_t pathbuf[MAX_FN_LEN / 2] = {0};
+    char *fullpath = (char *)pathbuf;
     if (!join_path(fullpath, path, info.fname, isdir)) {
       smenu.games.partial = true;
       continue;
@@ -1224,7 +1227,7 @@ static void games_scan(const char *path, unsigned depth) {
       e->filesize = (uint32_t)info.fsize;
       e->isdir = 0;
       e->attr = info.fattrib;
-      strcpy(e->fname, fullpath);
+      dma_memcpy16(e->fname, pathbuf, MAX_FN_LEN / 2);
       sortable_utf8_u16(info.fname, e->sortname);
       sdr_state->fileorder[smenu.games.count++] = e;
     }
@@ -3035,8 +3038,22 @@ static void keypress_menu_games(unsigned newkeys) {
     smenu.games.seloff = smenu.games.selector - BROWSER_ROWS + 1;
   if (newkeys & KEY_BUTTA) {
     const t_centry *e = sdr_state->fileorder[smenu.games.selector];
-    // Keep the full path, including directories, for the existing GBA loader.
-    browser_open(e->fname, e->filesize);
+    // Like the original browser, pass a path in internal RAM to the loader.
+    // SD I/O can remap cart memory; do not retain a path pointer into SDRAM.
+    uint16_t pathbuf[MAX_FN_LEN / 2];
+    dma_memcpy16(pathbuf, e->fname, MAX_FN_LEN / 2);
+    char *path = (char *)pathbuf;
+    if (!memchr(path, 0, MAX_FN_LEN) || !has_extension(path, ".gba")) {
+      spop.alert_msg = msgs[lang_id][MSG_ERR_UNKTYP];
+      return;
+    }
+    // Recheck the actual file before opening; it may have changed since scan.
+    FILINFO info;
+    if (f_stat(path, &info) != FR_OK || (info.fattrib & AM_DIR)) {
+      spop.alert_msg = msgs[lang_id][MSG_ERR_READ];
+      return;
+    }
+    browser_open(path, (uint32_t)info.fsize);
   }
 }
 
